@@ -4,13 +4,36 @@ library(tidyverse)
 library(sf)
 library(sp)
 library(leaflet)
+library(shinycssloaders)
 
-drop_auth()   ## Login to the PAWS dropbox folder
 
 
-countries <- drop_dir('PAWS/ALL') %>% filter(.tag == 'folder') %>% pull(name)
+drop_auth(rdstoken = "tokenfile.RDS")
 
-#locations <- drop_dir(paste0('PAWS/ALL/',input$country)) %>% filter(.tag == 'folder') %>% pull(name)
+getFolders <- function(path,type){
+  drop_dir(path) %>% filter(.tag == type) %>% select(name,path_display)
+}
+
+files <- drop_dir('PAWS/ALL') %>% 
+  filter(.tag == 'folder') %>% 
+  select(name,path_display) %>% 
+  group_by(name) %>% 
+  rename(Country = name) %>% 
+  nest() %>% 
+  mutate(location = map(data, ~getFolders(.$path_display,'folder'))) %>% 
+  unnest(location) %>% 
+  rename(Location = name) %>%
+  group_by(Country,Location) %>% 
+  nest() %>% 
+  mutate(Year = map(data, ~getFolders(.$path_display,'folder'))) %>% 
+  unnest(Year) %>% 
+  rename(Year = name) %>% 
+  group_by(Country,Location,Year) %>% 
+  nest() %>% 
+  mutate(Files = map(data, ~getFolders(.$path_display,'file'))) %>% 
+  unnest(Files) %>% 
+  rename(Files = name)
+
 
 ui <- fluidPage(
   
@@ -20,17 +43,16 @@ ui <- fluidPage(
   # Sidebar with a slider input for number of bins 
   sidebarLayout(
     sidebarPanel(
-      selectInput('country','Select Country', choices = countries),
+      selectInput('country','Select Country', choices = unique(files$Country)),
       uiOutput('location_ui'),
+      conditionalPanel('length(input.location) <= 1',uiOutput('year_ui')),
       actionButton('check','Update Map'),
-      conditionalPanel('length(input.location) == 1',uiOutput('year_ui')),
       uiOutput('speciesUI')
     ),
     
     # Show a plot of the generated distribution
     mainPanel(
-      #dataTableOutput("test")
-      leafletOutput('species_map')
+      withSpinner(leafletOutput('species_map'),type = 6)
     )
   )
 )
@@ -39,59 +61,53 @@ ui <- fluidPage(
 server <- function(input, output) {
   
   output$location_ui <- renderUI({
-    locations <- drop_dir(paste0('PAWS/ALL/',input$country)) %>% filter(.tag == 'folder') %>% pull(name)
-    selectInput('location','Select Location',choices = locations, multiple = T, selected = locations[1])
+    locations <- files %>% filter(Country == input$country) %>% pull(Location)
+    selectInput('location','Select Location',choices = unique(locations), multiple = T, selected = locations[1])
   })
   
   output$year_ui <- renderUI({
-    validate(need(input$check > 0, 'Press Button'))
     if(length(input$location) == 1){
-      years <- drop_dir(paste0('PAWS/ALL/',input$country,'/',input$location)) %>% filter(.tag == 'folder') %>% pull(name)
-      selectInput('year','Select year',choices = years)
+      years <- files %>% filter(Country == input$country, Location == input$location) %>% pull(Year)
+      selectInput('year','Select year',choices = unique(years))
     }
   })
   
-  datafiles <- function(){
-    input$check
-    isolate(
-    drop_dir(paste0('PAWS/All/',input$country)) %>%
-      filter(name %in% input$location) %>% 
-      rowwise %>% 
-      do(drop_dir(.$path_lower)) %>% 
-      filter(.tag == 'folder') %>% 
-      rowwise %>% 
-      do(drop_dir(.$path_lower)) %>% 
-      filter(.tag == 'file') 
-    )
-  }
+  dropdat <- reactiveValues()
   
-
-  trap_info <- reactive({
-      do.call(bind_rows,lapply(datafiles() %>% 
+  observeEvent(input$check,{
+      datafiles <- drop_dir(paste0('PAWS/All/',input$country)) %>%
+        filter(name %in% input$location) %>% 
+        rowwise %>% 
+        do(drop_dir(.$path_lower)) %>% 
+        filter(.tag == 'folder') %>% 
+        rowwise %>% 
+        do(drop_dir(.$path_lower)) %>% 
+        filter(.tag == 'file') 
+      
+      dropdat$trap_info <- do.call(bind_rows,lapply(datafiles %>% 
                                  filter(grepl('trap_info',path_lower)) %>% 
                                  pull(path_display), drop_read_csv)) %>% 
-      select(Station, Latitude, Longitude, Area)
-  })
-  
-  captures <- reactive({
-    do.call(bind_rows,lapply(datafiles() %>% 
-                               filter(grepl('species',path_lower)) %>% 
-                               pull(path_display), drop_read_csv)) %>% 
-      select(Station,Camera,Species,Directory, FileName) %>% 
-      mutate(date = sub('.*__ *(.*?) *__.*','\\1',FileName)) %>%
-      mutate(link = paste0('<a href=',gsub(' ','%20',paste0('https://www.dropbox.com/home',gsub("^.*\\Trust)", "", Directory))),'?preview=',gsub(' ','+',FileName),'>',date,'</a>')) %>%
-      group_by(Station,Species) %>% summarise(n = n(), link = paste(link, collapse = '<br/>'))
+        select(Station, Latitude, Longitude, Area)
+      
+      dropdat$captures <- do.call(bind_rows,lapply(datafiles %>% 
+                                                  filter(grepl('species',path_lower)) %>% 
+                                                  pull(path_display), drop_read_csv)) %>% 
+        select(Station,Camera,Species,Directory, FileName) %>% 
+        mutate(date = sub('.*__ *(.*?) *__.*','\\1',FileName)) %>%
+        mutate(link = paste0('<a href=',gsub(' ','%20',paste0('https://www.dropbox.com/home',gsub("^.*\\Trust)", "", Directory))),'?preview=',gsub(' ','+',FileName),' target = "_blank">',date,'</a>')) %>%
+        group_by(Station,Species) %>% summarise(n = n(), link = paste(link, collapse = '<br/>'))
+
+      file.remove(paste0(tempdir(),'/',list.files(tempdir())))
   })
   
   output$speciesUI <- renderUI({
-    validate(need(input$check > 0, ''))
-    selectInput('species','Select Species:',choices = unique(captures()$Species))
+    validate(need(is.null(dropdat$captures) == F, ''))
+    selectInput('species','Select Species:',choices = unique(dropdat$captures$Species))
   })
   
-
   output$species_map <- renderLeaflet({
-    validate(need(input$check > 0, ''))
-    dat <- left_join(trap_info(),captures() %>% filter(Species == input$species))
+    validate(need(is.null(dropdat$captures) == F & is.null(input$species) == F, ''))
+    dat <- left_join(dropdat$trap_info,dropdat$captures %>% filter(Species == input$species))
     dat$n <- as.numeric(ifelse(is.na(dat$n),0,dat$n))
     dat$link <- ifelse(is.na(dat$link),'',dat$link)
     dat$link <- paste(paste0('<b>',dat$Area,'</b>'),dat$Station,dat$link,sep = '<br/>')
@@ -103,10 +119,9 @@ server <- function(input, output) {
       addCircleMarkers(lng = ~Longitude,lat = ~Latitude, fill = T,fillColor = ~pal(n), stroke = T,color = 'black', fillOpacity = .8, radius = 4, weight = 1, popup = ~paste(link)) %>% 
       addLegend('bottomright',pal = pal,values = ~n,title = 'Captures') %>% 
       addLayersControl(baseGroups = c('OSM','Terrain','Sattelite'))
-    
-    
   })
-
+  
+  
 }
 
 
